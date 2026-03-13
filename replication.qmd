@@ -1,0 +1,159 @@
+---
+title: "Paper Replication"
+author: "Rito, Gianluigi, Yann"
+format: pdf
+---
+
+```{r libraries, message=FALSE, warning=FALSE}
+library(foreign)
+library(tidyverse)
+library(survival)
+library(KernSmooth)
+library(knitr)
+library(kableExtra)
+library(stargazer)read.dta("/home/linus/Code/schluter/data/fi.dta")
+library(here)
+#here gave issues with quarto
+
+udat <- read.dta("/home/linus/Code/schluter/data/fi.dta")
+udat <- udat[, 1:134]
+```
+
+## Q1 - Research Objectives
+
+Lalive, van Ours & Zweimüller (2006) study how changes in two key parameters of unemployment insurance — the replacement rate (RR) and the potential benefit duration (PBD) — causally affect unemployment duration. The paper makes three main contributions.
+
+**Identification strategy.** The authors exploit an Austrian UI reform in August 1989 that generated four distinct treatment groups based on age, work experience, and prior earnings: workers who received only a higher RR, only a longer PBD, both, or neither. The policy was enacted in a stable macroeconomic environment, reducing the endogenous-policy bias that affects many UI studies.
+
+**Joint identification.** Most previous work estimated the effect of changing one parameter at a time. This paper uniquely allows estimation of interaction effects: does a joint increase in RR and PBD generate larger disincentives than the sum of two separate changes?
+
+**Results.** Both an increase in RR and an extension of PBD significantly increase unemployment duration. The pattern matches job-search theory: the RR increase depresses the exit rate from the start of the spell, while the PBD extension has its main effect around the old exhaustion date. Older workers react more strongly, rationalised by weaker labour-market attachment and proximity to early retirement. The behavioural cost component of PBD extensions reaches ~50% of total extra UI costs, leading to a clear policy recommendation: PBD is a more powerful incentive tool than the benefit level.
+
+## Q2 - Difference-in-Differences
+
+```{r q2-did}
+udat <- udat %>% mutate(dur104 = pmin(dur, 104))
+
+did_raw <- udat %>%
+  mutate(group = recode(as.character(type),
+    "PBD"        = "ePBD",
+    "RR"         = "eRR",
+    "PBD and RR" = "ePBD-RR",
+    "control"    = "control")) %>%
+  group_by(group, after) %>%
+  summarise(m = mean(dur104), se = sd(dur104)/sqrt(n()), N = n(),
+            .groups = "drop") %>%
+  pivot_wider(names_from = after, values_from = c(m, se, N), names_sep = "_")
+
+ctrl_chg <- with(did_raw[did_raw$group == "control", ], m_1 - m_0)
+
+did_raw %>%
+  mutate(change = m_1 - m_0,
+         did    = ifelse(group != "control", change - ctrl_chg, NA)) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 2))) %>%
+  mutate(
+    before = paste0(m_0, " (", se_0, ")"),
+    after  = paste0(m_1, " (", se_1, ")"),
+    change = as.character(change),
+    did    = ifelse(is.na(did), "---", as.character(did))
+  ) %>%
+  select(group, before, N_0, after, N_1, change, did) %>%
+  kable(
+    format    = "latex",
+    booktabs  = TRUE,
+    col.names = c("Group", "Before Aug 1989", "N",
+                  "After Aug 1989", "N",
+                  "Change", "Diff-in-diff"),
+    caption   = "Average unemployment duration in first 104 weeks (measured in weeks)"
+  ) %>%
+  kable_styling(latex_options = c("hold_position"))
+```
+
+## Q3 - Survival Functions
+
+```{r q3-km}
+km_surv_df <- function(type_val) {
+  sub <- udat %>% filter(type == type_val)
+  km  <- survfit(Surv(dur104, uncc) ~ after, data = sub)
+  data.frame(
+    time   = km$time,
+    surv   = km$surv,
+    period = ifelse(rep(grepl("=0", names(km$strata)), km$strata),
+                    "Before", "After"),
+    panel  = type_val
+  )
+}
+
+surv_data <- bind_rows(lapply(c("PBD", "RR", "PBD and RR", "control"), km_surv_df))
+
+ggplot(surv_data, aes(x = time, y = surv, linetype = period)) +
+  geom_step() +
+  facet_wrap(~ panel, ncol = 2) +
+  scale_linetype_manual(values = c("Before" = "dashed", "After" = "solid")) +
+  labs(x = "Unemployment duration (weeks)", y = "Survival probability") +
+  theme_bw()
+```
+
+## Q4 - Exit Hazard
+
+```{r q4-hazard}
+smooth_haz <- function(type_val, after_val) {
+  sub   <- udat %>% filter(type == type_val, after == after_val)
+  km    <- survfit(Surv(dur104, uncc) ~ 1, data = sub)
+  t_seq <- 1:100
+  S_t   <- summary(km, times = t_seq, extend = TRUE)$surv
+  S_lag <- c(1, S_t[-length(S_t)])
+  h_raw <- (S_lag - S_t) / pmax(S_lag, 1e-10)
+  sm    <- KernSmooth::locpoly(t_seq, h_raw, bandwidth = 1.5,
+                               gridsize = 100, range.x = c(1, 100))
+  data.frame(time = sm$x, hazard = pmax(sm$y, 0),
+             period = ifelse(after_val == 0, "Before", "After"),
+             panel  = type_val)
+}
+
+haz_data <- bind_rows(lapply(c("PBD", "RR", "PBD and RR", "control"), function(tp)
+  bind_rows(smooth_haz(tp, 0), smooth_haz(tp, 1))))
+
+ggplot(haz_data, aes(x = time, y = hazard, linetype = period)) +
+  geom_line() +
+  facet_wrap(~ panel, ncol = 2) +
+  scale_linetype_manual(values = c("Before" = "dashed", "After" = "solid")) +
+  scale_y_continuous(limits = c(0, 0.15)) +
+  labs(x = "Unemployment duration (weeks)", y = "Hazard") +
+  theme_bw()
+```
+
+## Q5 - PWE PH Model
+
+```{r q5-pwe, cache=TRUE}
+udat <- udat %>% mutate(all = tr * (t39 + t52))
+
+breaks <- seq(from = 3, to = 59, by = 4)
+labels <- paste("(", c(0, breaks), ",", c(breaks, 104), "]", sep = "")
+
+gux <- survSplit(Surv(dur104, uncc) ~ ., data = udat, cut = breaks,
+                 end = "time", event = "death", start = "start",
+                 episode = "interval") %>%
+  mutate(exposure = time - start,
+         interval = factor(interval + 1, labels = labels))
+
+pwe <- glm(death ~ interval + offset(log(exposure)) +
+             age + sfrau + married + single + divorced +
+             f_marr + f_single + f_divor + med_educ + hi_educ + lehre +
+             lwage + bc + pnon_10 + ten72 + seasonal + manuf +
+             q2 + q3 + q4 + y1988 + y1989 + y1990 + y1991 +
+             t39 + t52 + tr + all + after +
+             t39_a0 + t52_a0 + tr_a0 + t39tra0 + t52tra0,
+           family = poisson(link = "log"),
+           data   = gux)
+```
+
+```{r q5-table}
+stargazer(pwe,
+          dep.var.caption = "", dep.var.labels = "",
+          keep = 1:15,
+          omit.table.layout = "n", star.cutoffs = NA,
+          keep.stat = c("n", "ll"), no.space = TRUE,
+          header = FALSE,
+          title = "The PWE model", type = "text")
+```
