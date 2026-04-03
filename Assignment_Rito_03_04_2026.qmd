@@ -1,0 +1,235 @@
+---
+title: "Replication_How Changes in Financial Incentives Affect the Duration of Unemployment"
+author: "Jan, Rito, Gian"
+format: pdf
+editor: visual
+---
+
+## Quarto
+
+Quarto enables you to weave together content and executable code into a finished document. To learn more about Quarto see <https://quarto.org>.
+
+## Running Code
+
+When you click the **Render** button a document will be generated that includes both content and the output of embedded code. You can embed code like this:
+
+```{r}
+rm(list = ls())
+library(foreign)  ## for: read.dta
+## do not use haven::read_dta since this messes up `udat$type` factor labels
+library(tidyverse)
+
+library(survival)
+#setwd()
+udat <- read.dta("fi.dta")  
+udat <- udat[,1:134] ## get rid of some superfluous variables
+udat <- as_tibble(udat)
+
+dim(udat)  ## N = 225,821
+```
+
+You can add options to executable code like this
+
+```{r}
+glimpse(udat[,1:36])
+
+```
+
+The `echo: false` option disables the printing of code (only output is displayed).
+
+```{r}
+table(udat$type)
+```
+
+```{r}
+## Computation of average spells when durations are truncated at 104 weeks
+udat <- udat %>%
+  mutate(dur104 = dur,
+        dur104 = ifelse(dur104 > 104, 104, dur104)) 
+
+
+```
+
+Diff-in-Diff estimates
+
+```{r}
+# Raw means by type and period
+table4 <- udat %>%
+  group_by(type, after) %>%
+  summarise(
+    mean = round(mean(dur104), 2),
+    sd   = round(sd(dur104) / sqrt(n()), 2),   # SE
+    N    = n(),
+    .groups = "drop"
+  )
+
+# Pivot to wide: columns 0 (before) and 1 (after)
+table4_wide <- table4 %>%
+  pivot_longer(cols = c(mean, sd, N), names_to = "name") %>%
+  pivot_wider(names_from = after, values_from = value)
+
+# diff and DiD (mean rows only; control DiD = 0 by construction)
+control_diff <- table4_wide %>%
+  filter(type == "control", name == "mean") %>%
+  mutate(diff = `1` - `0`) %>%
+  pull(diff)
+
+table4_wide <- table4_wide %>%
+  mutate(
+    diff = if_else(name == "mean", round(`1` - `0`, 2),        NA_real_),
+    DiD  = if_else(name == "mean", round(diff - control_diff, 2), NA_real_)
+  )
+
+print(table4_wide)
+
+```
+
+```{r}
+# Model: dur104 ~ type + after  (control is reference category)
+# coef[2:3] = typePBD and typeRR dummies
+
+# Set control as reference category
+udat <- udat %>%
+  mutate(type = relevel(factor(type), ref = "control"))
+
+# DiD regression
+mod1 <- lm(dur104 ~ type * after, data = udat)
+
+
+broom::tidy(mod1) %>%
+  filter(str_detect(term, ":")) %>%
+  select(term, estimate, std.error)
+
+
+```
+
+Survival Function A typical Kaplan-Meier survivor function:
+
+```{r}
+
+# Fit KM separately for each group × period combination
+km_fit <- survfit(Surv(dur104, uncc) ~ type + after, data = udat)
+
+summary(km_fit)
+
+```
+
+Plot the K-M estimates
+
+```{r}
+###Survival Function
+library(ggplot2)
+
+# Extract KM estimates into a tidy dataframe
+km_df <- broom::tidy(km_fit)
+
+# Plot: one panel per type, before vs after
+km_df %>%
+  mutate(
+    after = if_else(str_detect(strata, "after=1"), "After", "Before"),
+    type  = str_extract(strata, "(?<=type=)[^,]+")
+  ) %>%
+  filter(time <= 100) %>%
+  ggplot(aes(x = time, y = estimate, linetype = after)) +
+  geom_step() +
+  facet_wrap(~ type, nrow = 2) +
+  scale_linetype_manual(values = c("Before" = "dashed", "After" = "solid")) +
+  scale_y_continuous(limits = c(0, 1)) +
+  scale_x_continuous(breaks = seq(0, 100, 20)) +
+  labs(x = "Unemployment duration (weeks)",
+       y = "Survival probability",
+       linetype = NULL) +
+  theme_bw() +
+  theme(legend.position = "bottom")
+```
+
+```{r}
+### Unemployment Hazard Rates (Figure 4)
+library(KernSmooth)
+km_df %>%
+  mutate(
+    after    = if_else(str_detect(strata, "after=1"), "After", "Before"),
+    type     = str_extract(strata, "(?<=type=)[^,]+"),
+    type = factor(type, levels = c("PBD", "RR", "PBD and RR", "control")),
+    time_bin = floor(time / 4) * 4
+  ) %>%
+  filter(time <= 100) %>%
+  group_by(type, after, time_bin) %>%
+  summarise(
+    n.event = sum(n.event),
+    n.risk  = first(n.risk),
+    .groups = "drop"
+  ) %>%
+  mutate(hazard = n.event / n.risk) %>%
+  group_by(type, after) %>%
+  mutate(
+    hazard_smooth = locpoly(
+      x         = time_bin,
+      y         = hazard,
+      degree    = 3,
+      bandwidth = 2.5,
+      gridsize  = n()
+    )$y
+  ) %>%
+  ungroup() %>%
+  ggplot(aes(x = time_bin, y = hazard_smooth, linetype = after)) +
+  geom_line() +
+  facet_wrap(~ type, nrow = 2) +
+  scale_linetype_manual(values = c("Before" = "dashed", "After" = "solid")) +
+  scale_x_continuous(breaks = seq(0, 100, 20)) +
+  scale_y_continuous(limits = c(0, NA)) +
+  labs(
+    x        = "Unemployment duration (weeks)",
+    y        = "Exit hazard",
+    linetype = NULL
+  ) +
+  theme_bw() +
+  theme(legend.position = "bottom")
+```
+
+Piecewise Exponential Likelihood
+
+```{r q5-pwe, cache=TRUE}
+udat <- udat %>% mutate(all = tr * (t39 + t52))
+
+breaks <- seq(from = 3, to = 59, by = 4)
+labels <- paste("(", c(0, breaks), ",", c(breaks, 104), "]", sep = "")
+
+gux <- survSplit(Surv(dur104, uncc) ~ ., data = udat, cut = breaks,
+                 end = "time", event = "death", start = "start",
+                 episode = "interval") %>%
+  mutate(exposure = time - start,
+         interval = factor(interval + 1, labels = labels))
+
+pwe <- glm(death ~ interval + offset(log(exposure)) +
+             ## Individual characteristics
+             age + sfrau + married + single + divorced +
+             f_marr + f_single + f_divor + med_educ + hi_educ + lehre +
+             lwage + bc + pnon_10 + ten72 + seasonal + manuf +
+             q2 + q3 + q4 + y1988 + y1989 + y1990 + y1991 +
+             ## Ex ante group indicators
+             t39 + t52 + tr + all +
+             ## Common time trend
+             after +
+             ## δ_1l: PBD 30→39 per interval
+             t39tra0  + t39tra1  + t39tra2  + t39tra3  + t39tra4  +
+             t39tra5  + t39tra6  + t39tra7  + t39tra8  + t39tra9  +
+             t39tra10 + t39tra11 + t39tra12 + t39tra13 + t39tra14 + t39tra15 +
+             ## δ_2l: PBD 30→52 per interval
+             t52tra0  + t52tra1  + t52tra2  + t52tra3  + t52tra4  +
+             t52tra5  + t52tra6  + t52tra7  + t52tra8  + t52tra9  +
+             t52tra10 + t52tra11 + t52tra12 + t52tra13 + t52tra14 + t52tra15 +
+             ## δ_3l: RR per interval
+             tr_a0  + tr_a1  + tr_a2  + tr_a3  + tr_a4  +
+             tr_a5  + tr_a6  + tr_a7  + tr_a8  + tr_a9  +
+             tr_a10 + tr_a11 + tr_a12 + tr_a13 + tr_a14 + tr_a15,
+           family = poisson(link = "log"),
+           data   = gux %>% filter(exposure > 0))
+stargazer(pwe,
+          dep.var.caption = "", dep.var.labels = "",
+          keep = 1:15,
+          omit.table.layout = "n", star.cutoffs = NA,
+          keep.stat = c("n", "ll"), no.space = TRUE,
+          header = FALSE,
+          title = "The PWE model", type = "text")
+```
